@@ -1,0 +1,22 @@
+# Dependencias y compilados
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Variables de entorno (solo se versionan los .env.example)
+.env
+.env.*
+!.env.example
+
+# Lockfiles sueltos: el monorepo usa solo el pnpm-lock.yaml de la raíz
+apps/*/pnpm-lock.yaml
+
+# Enlaces de skills por editor (apuntan a .agents/skills, que sí se versiona)
+apps/*/.claude/skills/
+apps/*/.windsurf/skills/
+
+# Sistema operativo y editores
+.DS_Store
+Thumbs.db
+.idea/

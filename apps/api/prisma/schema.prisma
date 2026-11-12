@@ -1,0 +1,237 @@
+// Esquema del programa de puntos — MVP (puntos por consumo, QR personal y catálogo)
+// Docs: https://pris.ly/d/prisma-schema
+//
+// Regla clave: el saldo vive como caché en Customer.balance, pero la fuente de verdad es
+// PointTransaction (libro de movimientos). Ambos se actualizan en la MISMA transacción.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────────── Enums ─────────────────────────────
+
+enum StaffRole {
+  ADMIN
+  CASHIER
+}
+
+enum CustomerStatus {
+  ACTIVE
+  BLOCKED
+}
+
+enum PointTransactionType {
+  PURCHASE // consumo registrado en caja
+  WELCOME // bono de bienvenida
+  BIRTHDAY // bono de cumpleaños
+  REDEMPTION // canje de un premio (negativo)
+  REDEMPTION_REFUND // devolución por canje cancelado o vencido
+  ADJUSTMENT // ajuste manual con motivo
+  REVERSAL // reversa de un movimiento erróneo
+}
+
+enum RedemptionStatus {
+  PENDING // código generado, aún no entregado
+  USED // validado en caja y entregado
+  CANCELLED // cancelado (se devuelven los puntos)
+  EXPIRED // venció sin usarse (se devuelven los puntos)
+}
+
+// ─────────────────────── Configuración del programa ───────────────────────
+
+/// Fila única (id = 1) con las reglas del programa, editables desde el panel.
+model ProgramSettings {
+  id                  Int      @id @default(1)
+  /// Cada `unitAmountCop` pesos de consumo otorgan `pointsPerUnit` puntos.
+  unitAmountCop       Int      @default(10000) @map("unit_amount_cop")
+  pointsPerUnit       Int      @default(10) @map("points_per_unit")
+  welcomeBonusPoints  Int      @default(20) @map("welcome_bonus_points")
+  birthdayBonusPoints Int      @default(100) @map("birthday_bonus_points")
+  /// Horas que dura un código de canje antes de vencer.
+  redemptionTtlHours  Int      @default(48) @map("redemption_ttl_hours")
+  /// Meses para que venzan los puntos; null = no vencen.
+  pointsExpiryMonths  Int?     @map("points_expiry_months")
+  updatedAt           DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@map("program_settings")
+}
+
+// ───────────────────────────── Personal ─────────────────────────────
+
+model StaffUser {
+  id           String    @id @default(uuid()) @db.Uuid
+  email        String    @unique
+  name         String
+  passwordHash String    @map("password_hash")
+  role         StaffRole @default(CASHIER)
+  active       Boolean   @default(true)
+  lastLoginAt  DateTime? @map("last_login_at") @db.Timestamptz(3)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  purchases            Purchase[]
+  transactionsCreated  PointTransaction[]
+  redemptionsValidated Redemption[]
+
+  @@map("staff_users")
+}
+
+// ───────────────────────────── Clientes ─────────────────────────────
+
+model Customer {
+  id        String         @id @default(uuid()) @db.Uuid
+  /// Celular en formato E.164, p. ej. +573001234567. Identificador del cliente.
+  phone     String         @unique
+  name      String
+  birthDate DateTime?      @map("birth_date") @db.Date
+  email     String?
+  status    CustomerStatus @default(ACTIVE)
+
+  /// Caché del saldo. La verdad está en PointTransaction. Nunca negativo (CHECK en la migración).
+  balance Int @default(0)
+
+  /// Token aleatorio que va dentro del QR personal. Se puede regenerar si se filtra.
+  qrToken String @unique @map("qr_token")
+
+  /// Ley 1581: autorización de tratamiento de datos (obligatoria) y de promociones (opcional).
+  dataConsentAt             DateTime  @map("data_consent_at") @db.Timestamptz(3)
+  dataConsentVersion        String    @map("data_consent_version")
+  marketingConsentAt        DateTime? @map("marketing_consent_at") @db.Timestamptz(3)
+  marketingConsentRevokedAt DateTime? @map("marketing_consent_revoked_at") @db.Timestamptz(3)
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  transactions PointTransaction[]
+  purchases    Purchase[]
+  redemptions  Redemption[]
+
+  @@index([createdAt])
+  @@map("customers")
+}
+
+/// Códigos de un solo uso para iniciar sesión del cliente (se guarda solo el hash).
+model OtpCode {
+  id         String    @id @default(uuid()) @db.Uuid
+  phone      String
+  codeHash   String    @map("code_hash")
+  attempts   Int       @default(0)
+  expiresAt  DateTime  @map("expires_at") @db.Timestamptz(3)
+  consumedAt DateTime? @map("consumed_at") @db.Timestamptz(3)
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([phone, createdAt])
+  @@map("otp_codes")
+}
+
+// ───────────────────────────── Consumos ─────────────────────────────
+
+model Purchase {
+  id             String   @id @default(uuid()) @db.Uuid
+  customerId     String   @map("customer_id") @db.Uuid
+  /// Número de factura del POS. Único: una factura suma puntos una sola vez.
+  invoiceNumber  String   @unique @map("invoice_number")
+  /// Valor del consumo en pesos colombianos (sin decimales).
+  amountCop      Int      @map("amount_cop")
+  pointsEarned   Int      @map("points_earned")
+  registeredById String   @map("registered_by_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  customer     Customer          @relation(fields: [customerId], references: [id])
+  registeredBy StaffUser         @relation(fields: [registeredById], references: [id])
+  transaction  PointTransaction?
+
+  @@index([customerId, createdAt])
+  @@map("purchases")
+}
+
+// ─────────────────────── Libro de movimientos ───────────────────────
+
+/// Libro de movimientos: solo se insertan filas, nunca se editan ni borran.
+/// Un error se corrige con un movimiento REVERSAL o ADJUSTMENT.
+model PointTransaction {
+  id           String               @id @default(uuid()) @db.Uuid
+  customerId   String               @map("customer_id") @db.Uuid
+  type         PointTransactionType
+  /// Positivo suma, negativo descuenta. Nunca 0 (CHECK en la migración).
+  points       Int
+  /// Saldo del cliente justo después de este movimiento (auditoría).
+  balanceAfter Int                  @map("balance_after")
+  reason       String?
+
+  /// Origen del movimiento (uno a la vez, según el tipo).
+  purchaseId            String? @unique @map("purchase_id") @db.Uuid
+  redemptionId          String? @map("redemption_id") @db.Uuid
+  reversedTransactionId String? @unique @map("reversed_transaction_id") @db.Uuid
+
+  /// Evita duplicar bonos automáticos, p. ej. "WELCOME:<customerId>" o "BIRTHDAY:<customerId>:2026".
+  idempotencyKey String? @unique @map("idempotency_key")
+
+  /// Empleado que lo generó; null = sistema.
+  createdById String?  @map("created_by_id") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  customer   Customer    @relation(fields: [customerId], references: [id])
+  purchase   Purchase?   @relation(fields: [purchaseId], references: [id])
+  redemption Redemption? @relation(fields: [redemptionId], references: [id])
+  createdBy  StaffUser?  @relation(fields: [createdById], references: [id])
+
+  reversedTransaction PointTransaction? @relation("Reversal", fields: [reversedTransactionId], references: [id])
+  reversedBy          PointTransaction? @relation("Reversal")
+
+  /// Un canje genera como máximo un descuento y una devolución.
+  @@unique([redemptionId, type])
+  @@index([customerId, createdAt])
+  @@map("point_transactions")
+}
+
+// ───────────────────────────── Premios ─────────────────────────────
+
+model Reward {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String
+  description String?
+  imageUrl    String?  @map("image_url")
+  pointsCost  Int      @map("points_cost")
+  /// null = sin límite de unidades.
+  stock       Int?
+  active      Boolean  @default(true)
+  sortOrder   Int      @default(0) @map("sort_order")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  redemptions Redemption[]
+
+  @@index([active, sortOrder])
+  @@map("rewards")
+}
+
+model Redemption {
+  id            String           @id @default(uuid()) @db.Uuid
+  customerId    String           @map("customer_id") @db.Uuid
+  rewardId      String           @map("reward_id") @db.Uuid
+  /// Puntos cobrados en el momento del canje (el costo del premio puede cambiar después).
+  pointsSpent   Int              @map("points_spent")
+  /// Código de un solo uso que el cliente muestra en caja.
+  code          String           @unique
+  status        RedemptionStatus @default(PENDING)
+  expiresAt     DateTime         @map("expires_at") @db.Timestamptz(3)
+  usedAt        DateTime?        @map("used_at") @db.Timestamptz(3)
+  validatedById String?          @map("validated_by_id") @db.Uuid
+  cancelledAt   DateTime?        @map("cancelled_at") @db.Timestamptz(3)
+  createdAt     DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  customer     Customer           @relation(fields: [customerId], references: [id])
+  reward       Reward             @relation(fields: [rewardId], references: [id])
+  validatedBy  StaffUser?         @relation(fields: [validatedById], references: [id])
+  transactions PointTransaction[]
+
+  @@index([customerId, createdAt])
+  @@index([status, expiresAt])
+  @@map("redemptions")
+}

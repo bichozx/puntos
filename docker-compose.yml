@@ -1,0 +1,18 @@
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: puntos-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: puntos_dev
+      TZ: UTC
+    ports:
+      # Puerto del PC → 5432 del contenedor. Debe coincidir con el de DATABASE_URL en backend/.env
+      - "127.0.0.1:${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql  # PostgreSQL 18+: datos en /var/lib/postgresql/18/docker
+
+volumes:
+  postgres_data:
